@@ -62,11 +62,15 @@ for fun,defs in pairs(fundefs) do
 	structs[stname] = structs[stname] or {}
 	table.insert(structs[stname],fun)
 end
---delete templated
+--delete templated / non-POD helpers that break Lua codegen
 structs.ImVec4 = nil
 structs.ImVector = nil
 structs.ImChunkStream = nil
 structs.ImPool = nil
+structs.ImStableVector = nil
+structs.ImSpan = nil
+structs.ImSpanAllocator = nil
+structs.ImBitArray = nil
 
 
 
@@ -105,8 +109,19 @@ local function testcode(codestr)
 	end
 end
 
+-- C++ cimgui glue (ConvertToCPP / cast wrappers) must not appear in Lua signatures.
+local function strip_cpp_call_sugar(s)
+	s = s:gsub("ConvertToCPP_%w+%(([%w_]+)%)", "%1")
+	s = s:gsub("ConvertFromCPP_%w+%(([%w_]+)%)", "%1")
+	s = s:gsub("reinterpret_cast%s*<%s*[^>]+%>%s*%(([%w_]+)%)", "%1")
+	s = s:gsub("static_cast%s*<%s*[^>]+%>%s*%(([%w_]+)%)", "%1")
+	s = s:gsub("const_cast%s*<%s*[^>]+%>%s*%(([%w_]+)%)", "%1")
+	return s
+end
+
 --this replaces reserved lua words and not valid tokens
 function sanitize_reserved(def)
+	def.call_args = strip_cpp_call_sugar(def.call_args or "")
 	local words = {["in"]="_in",["repeat"]="_repeat"}
 	for k,w in pairs(words) do
 		local pat = "([%(,])("..k..")([,%)])"
@@ -142,6 +157,15 @@ function sanitize_reserved(def)
 	end
 end
 
+local function is_byvalue_c_return(ret)
+	if not ret then return false end
+	-- Modern cimgui returns ImVec2_c / ImVec4_c / ... by value (np_ret).
+	-- Legacy nonUDT used an ImVec2* pOut first argument instead.
+	return ret:match("_c$") ~= nil
+		or ret == "ImVec2" or ret == "ImVec4" or ret == "ImVec2i"
+		or ret == "ImRect" or ret == "ImColor" or ret == "ImTextureRef"
+end
+
 local function make_function(method,def)
 	sanitize_reserved(def)
 	local fname = def.ov_cimguiname or def.cimguiname --overloaded or original
@@ -166,21 +190,23 @@ local function make_function(method,def)
 		for k,v in pairs(def.defaults) do
 			if v == 'true' then
 				table.insert(code,"    if "..k.." == nil then "..k.." = "..v.." end")
+			elseif v == 'NULL' or v == '((void*)0)' then
+				table.insert(code,"    "..k.." = "..k.." or nil")
 			else
 				table.insert(code,"    "..k.." = "..k.." or "..v)
 			end
 		end
-		if def.nonUDT == 1 then
-			--allocate variable for return value
-			local out_type = def.argsT[1].type:gsub("*", "")
+		-- By-value ImVec2_c returns: just call and return (do NOT invent a pOut arg).
+		if def.nonUDT == 1 and is_byvalue_c_return(def.ret) then
+			table.insert(code,"    return lib."..fname..args)
+		elseif def.nonUDT == 1 and def.argsT and def.argsT[1] and def.argsT[1].type:match("%*$") then
+			-- Legacy nonUDT: first arg is ImVec2* pOut
+			local out_type = def.argsT[1].type:gsub("%*$", ""):gsub("^const ", "")
 			table.insert(code,'    local nonUDT_out = ffi.new("'..out_type..'")')
-			--prepend nonUDT_out to args
 			args = args:gsub("%(", "(nonUDT_out" .. (empty and "" or ","), 1)
-			--call cimgui and return value of out variable
 			table.insert(code,"    lib."..fname..args)
 			table.insert(code,"    return nonUDT_out")
 		else
-			--call cimgui
 			table.insert(code,"    return lib."..fname..args)
 		end
 		table.insert(code,"end")
@@ -225,18 +251,30 @@ local cdefs = dofile("./imgui/cdefs.lua")
 local ffi = require"ffi"
 ffi.cdef(cdefs)
 local function checktype(typ,va)
-	if ffi.typeof(typ)==ffi.typeof"int" or 
-		ffi.typeof(typ)==ffi.typeof"float" or
-		ffi.typeof(typ)==ffi.typeof"double" then
+	-- Skip template leftovers that cannot be typeof()'d
+	if typ == "T" or typ:match("^T[%W]") or typ:match("[%W]T$") or typ:match("<") then
+		return "true"
+	end
+	-- ImVec2_c / ImVec4_c: accept both _c and ImVec2 aliases used by scripts
+	local alias = typ:match("^(ImVec%d)_c$") or typ:match("^const (ImVec%d)_c$")
+	local ok, kind = pcall(ffi.typeof, typ)
+	if not ok then
+		return "true"
+	end
+	if kind==ffi.typeof"int" or
+		kind==ffi.typeof"float" or
+		kind==ffi.typeof"double" then
 		return "(ffi.istype('"..typ.."',"..va..") or type("..va..")=='number')"
-	elseif ffi.typeof(typ)==ffi.typeof"bool" then
+	elseif kind==ffi.typeof"bool" then
 		return "(ffi.istype('"..typ.."',"..va..") or type("..va..")=='boolean')"
-	elseif ffi.typeof(typ)==ffi.typeof"const char*" then
+	elseif kind==ffi.typeof"const char*" then
 		return "(ffi.istype('"..typ.."',"..va..") or type("..va..")=='string')"
-	elseif ffi.typeof(typ)==ffi.typeof"const float*" then
+	elseif kind==ffi.typeof"const float*" then
 		return "(ffi.istype('"..typ.."',"..va..") or ffi.istype('float[]',"..va.."))"
-	elseif ffi.typeof(typ)==ffi.typeof"int*" then
+	elseif kind==ffi.typeof"int*" then
 		return "(ffi.istype('"..typ.."',"..va..") or ffi.istype('int[]',"..va.."))"
+	elseif alias then
+		return "(ffi.istype('"..typ.."',"..va..") or ffi.istype('"..alias.."',"..va.."))"
 	else
 		return "ffi.istype('"..typ.."',"..va..")"
 	end
